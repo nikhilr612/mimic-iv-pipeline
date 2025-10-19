@@ -1,0 +1,37 @@
+[project]
+name = "mimic-iv-pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "xgboost",
+    "tqdm",
+    "scikit-learn",
+    "ipywidgets",
+    "imbalanced-learn",
+    "torch",
+    "nltk",
+    "requests",
+    "import-ipynb",
+    "captum",
+    "pytorch-pretrained-bert",
+    "PyRuSH",
+    "medspacy",
+    "pydicom",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
