@@ -3,3 +3,11 @@ scrap
 *.gzip
 *.csv.gz
 *summary*.txt
+REPORT.md
+.DS_Store
+.ipynb_checkpoints
+.venv/
+data/
+images/
+images_v2/
+__pycache__/
