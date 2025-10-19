@@ -21,6 +21,7 @@ dependencies = [
     "PyRuSH",
     "medspacy",
     "pydicom",
+    "duckdb>=1.4.1",
 ]
 
 [tool.uv.sources]
