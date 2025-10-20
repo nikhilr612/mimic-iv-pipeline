@@ -9,9 +9,12 @@ import importlib
 from dataclasses import dataclass
 import duckdb
 import disease_cohort
+import logging
 
 importlib.reload(disease_cohort)
 import disease_cohort
+
+logger = logging.getLogger(__name__)
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "./../..")
 if not os.path.exists("./data/cohort"):
@@ -147,7 +150,11 @@ def get_visit_pts(
             visit = visit.merge(
                 pts, how="inner", left_on="subject_id", right_on="subject_id"
             )
+            original_count = len(visit)
             visit = visit.loc[(visit.dod.isna()) | (visit.dod >= visit[disch_col])]
+            dropped_count = original_count - len(visit)
+            if dropped_count > 0:
+                logger.info(f"Dropped {dropped_count:,} ICU stays where patient died during visit")
             if len(disease_label):
                 hids = disease_cohort.extract_diag_cohort(
                     visit["hadm_id"], disease_label, mimic4_path
@@ -175,7 +182,11 @@ def get_visit_pts(
 
         if use_admn:
             # remove hospitalizations with a death; impossible for readmission for such visits
+            original_count = len(visit)
             visit = visit.loc[visit.hospital_expire_flag == 0]
+            dropped_count = original_count - len(visit)
+            if dropped_count > 0:
+                logger.info(f"Dropped {dropped_count:,} hospitalizations with death (readmission analysis)")
         if len(disease_label):
             hids = disease_cohort.extract_diag_cohort(
                 visit["hadm_id"], disease_label, mimic4_path
@@ -248,7 +259,11 @@ def get_visit_pts(
     #     visit_pts['Age']=visit_pts[admit_col].dt.year - visit_pts['yob']
     #     visit_pts = visit_pts.loc[visit_pts['Age'] >= 18]
     visit_pts["Age"] = visit_pts["anchor_age"]
+    original_count = len(visit_pts)
     visit_pts = visit_pts.loc[visit_pts["Age"] >= 18]
+    dropped_count = original_count - len(visit_pts)
+    if dropped_count > 0:
+        logger.info(f"Dropped {dropped_count:,} visits from patients under 18 years old")
 
     ##Add Demo data
     eth = pd.read_csv(
@@ -308,7 +323,7 @@ def get_visit_pts_db(conn, params: ExtractionParams):
         # Query ICU stays data from existing table
         visit_query = f"""
         SELECT *,
-               EXTRACT(DAYS FROM ({params.disch_col} - {params.admit_col})) as los
+               EXTRACT(DAYS FROM (CAST({params.disch_col} AS TIMESTAMP) - CAST({params.admit_col} AS TIMESTAMP))) as los
         FROM icustays
         """
         visit = conn.execute(visit_query).df()
@@ -341,7 +356,8 @@ def get_visit_pts_db(conn, params: ExtractionParams):
         # Query admissions data from existing table and calculate LOS
         visit_query = f"""
         SELECT *,
-               EXTRACT(DAYS FROM ({params.disch_col} - {params.admit_col})) as los
+               EXTRACT(DAYS FROM (CAST({params.disch_col} AS TIMESTAMP) - CAST({params.admit_col} AS TIMESTAMP))) as los,
+               CAST(hospital_expire_flag AS INTEGER) as hospital_expire_flag
         FROM admissions
         """
         visit = conn.execute(visit_query).df()
@@ -369,8 +385,8 @@ def get_visit_pts_db(conn, params: ExtractionParams):
     ]
     pts_query = f"""
     SELECT {', '.join(pts_cols)},
-           (anchor_year - anchor_age) as yob,
-           anchor_year + (2019 - CAST(RIGHT(anchor_year_group, 4) AS INTEGER)) as min_valid_year
+           (CAST(anchor_year AS INTEGER) - CAST(anchor_age AS INTEGER)) as yob,
+           CAST(anchor_year AS INTEGER) + (2019 - CAST(RIGHT(anchor_year_group, 4) AS INTEGER)) as min_valid_year
     FROM patients
     """
     pts = conn.execute(pts_query).df()
@@ -383,7 +399,7 @@ def get_visit_pts_db(conn, params: ExtractionParams):
                p.anchor_year, p.anchor_age, p.yob, p.min_valid_year, p.dod, p.gender
         FROM ({visit_query}) v
         INNER JOIN ({pts_query}) p ON v.{params.group_col} = p.{params.group_col}
-        WHERE p.anchor_age >= 18
+        WHERE CAST(p.anchor_age AS INTEGER) >= 18
         """
     else:
         visit_pts_query = f"""
@@ -392,7 +408,7 @@ def get_visit_pts_db(conn, params: ExtractionParams):
                p.anchor_year, p.anchor_age, p.yob, p.min_valid_year, p.dod, p.gender
         FROM ({visit_query}) v
         INNER JOIN ({pts_query}) p ON v.{params.group_col} = p.{params.group_col}
-        WHERE p.anchor_age >= 18 AND p.min_valid_year IS NOT NULL
+        WHERE CAST(p.anchor_age AS INTEGER) >= 18 AND p.min_valid_year IS NOT NULL
         """
 
     visit_pts = conn.execute(visit_pts_query).df()
@@ -467,6 +483,10 @@ def partition_by_los(
     disch_col: str,
     valid_col: str,
 ):
+    # Type check and cast 'los' column to numeric if necessary
+    if not pd.api.types.is_numeric_dtype(df["los"]):
+        df["los"] = pd.to_numeric(df["los"], errors="coerce")
+
     invalid = df.loc[
         (df[admit_col].isna()) | (df[disch_col].isna()) | (df["los"].isna())
     ]

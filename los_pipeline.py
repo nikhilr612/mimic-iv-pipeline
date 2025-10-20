@@ -6,6 +6,8 @@ Single script that replicates the mainPipeline.ipynb functionality for MIMIC-IV 
 
 import os
 import sys
+import logging
+from datetime import datetime
 
 import pandas as pd
 
@@ -27,11 +29,14 @@ DISEASE_FILTER = "No Disease Filter"  # Options: 'No Disease Filter', 'Heart Fai
 # Feature Selection Configuration (Diagnoses always included for ICU)
 FEATURE_FLAGS = {
     "diagnosis": True,  # Always True - required
-    "procedures": True,
-    "medications": True,
+    "procedures": False,
+    "medications": False,
     "output_events": True,  # ICU specific
     "chart_events": True,  # ICU specific
 }
+
+# Database Configuration
+USE_DATABASE_MODE = True  # Use DuckDB-based preprocessing with CSV.gz cohort files
 
 # Time Series Configuration
 TIME_WINDOW_TYPE = (
@@ -50,6 +55,42 @@ IMPUTATION_METHOD = "forward fill and mean"  # Options: 'No Imputation', 'forwar
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MIMIC_DB_PATH = "../mimiciv.duckdb"
+
+# Item ID Lists for Feature Selection
+CHART_ITEMIDS_FILE = os.path.join(ROOT_DIR, "utils", "chart_itemids.txt")
+OUTPUT_ITEMIDS_FILE = os.path.join(ROOT_DIR, "utils", "output_itemids.txt")
+MED_ITEMIDS_FILE = os.path.join(ROOT_DIR, "utils", "med_itemids.txt")
+PROC_ITEMIDS_FILE = os.path.join(ROOT_DIR, "utils", "proc_itemids.txt")
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+
+
+def setup_logging():
+    """Setup logging configuration for the pipeline"""
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.join(ROOT_DIR, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Create log filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"los_pipeline_{timestamp}.log")
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
+    )
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging initialized. Log file: {log_file}")
+    return logger
+
+
+# Initialize logger
+logger = setup_logging()
 
 # =============================================================================
 # SETUP MODULE PATHS AND IMPORTS
@@ -79,30 +120,50 @@ def import_modules():
         import day_intervals_cohort_v3
 
         modules["cohort"] = day_intervals_cohort_v3
-        print("Successfully imported day_intervals_cohort_v3")
+        logger.info("Successfully imported day_intervals_cohort_v3")
     except ImportError as e:
-        print(f"Failed to import day_intervals_cohort_v3: {e}")
-        print("Please ensure you're running from the project root directory")
+        logger.error(f"Failed to import day_intervals_cohort_v3: {e}")
+        logger.error("Please ensure you're running from the project root directory")
         sys.exit(1)
 
-    # Import feature selection ICU
-    try:
-        import feature_selection_icu
+    # Import feature selection ICU based on configuration
+    if USE_DATABASE_MODE:
+        try:
+            import feature_selection_icu_db
 
-        modules["feature_icu"] = feature_selection_icu
-        print("Successfully imported feature_selection_icu")
-    except ImportError as e:
-        print(f"Failed to import feature_selection_icu: {e}")
-        sys.exit(1)
+            modules["feature_icu"] = feature_selection_icu_db
+            logger.info(
+                "Successfully imported feature_selection_icu_db (database mode)"
+            )
+        except ImportError as e:
+            logger.warning(f"Failed to import feature_selection_icu_db: {e}")
+            logger.info("Falling back to original feature_selection_icu...")
+            try:
+                import feature_selection_icu
+
+                modules["feature_icu"] = feature_selection_icu
+                logger.info("Successfully imported feature_selection_icu (fallback)")
+            except ImportError as e2:
+                logger.error(f"Failed to import both versions: {e}, {e2}")
+                sys.exit(1)
+    else:
+        try:
+            import feature_selection_icu
+
+            modules["feature_icu"] = feature_selection_icu
+            logger.info("Successfully imported feature_selection_icu (file mode)")
+        except ImportError as e:
+            logger.error(f"Failed to import feature_selection_icu: {e}")
+            sys.exit(1)
 
     # Import data generation ICU
     try:
         import data_generation_icu
 
         modules["data_gen_icu"] = data_generation_icu
-        print("Successfully imported data_generation_icu")
+        logger.info("Successfully imported data_generation_icu")
     except ImportError as e:
-        print(f"Failed to import data_generation_icu: {e}")
+        logger.error(f"Failed to import data_generation_icu: {e}")
         sys.exit(1)
 
     return modules
@@ -167,6 +228,45 @@ def get_version_path():
     return "mimiciv/3.1"
 
 
+def check_itemids_file(file_path):
+    """Check if itemids file exists and has content"""
+    if not os.path.exists(file_path):
+        return False
+
+    try:
+        with open(file_path, "r") as f:
+            content = f.read().strip()
+            # Check if file has non-comment, non-empty lines
+            lines = [
+                line.strip()
+                for line in content.split("\n")
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            return len(lines) > 0
+    except Exception as e:
+        logger.warning(f"Error reading {file_path}: {e}")
+        return False
+
+
+def check_feature_availability():
+    """Check which features are available based on itemids files"""
+    features_available = {
+        "chart_events": check_itemids_file(CHART_ITEMIDS_FILE),
+        "output_events": check_itemids_file(OUTPUT_ITEMIDS_FILE),
+        "medications": check_itemids_file(MED_ITEMIDS_FILE),
+        "procedures": check_itemids_file(PROC_ITEMIDS_FILE),
+    }
+
+    logger.info("Feature availability check:")
+    for feature, available in features_available.items():
+        status = (
+            "AVAILABLE" if available else "UNAVAILABLE (empty/missing itemids file)"
+        )
+        logger.info(f"  - {feature}: {status}")
+
+    return features_available
+
+
 # =============================================================================
 # MAIN PIPELINE FUNCTIONS
 # =============================================================================
@@ -174,20 +274,20 @@ def get_version_path():
 
 def extract_cohort():
     """Extract cohort data using MIMIC-IV v3 ICU data"""
-    print("=" * 60)
-    print("STEP 1: COHORT EXTRACTION")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("STEP 1: COHORT EXTRACTION")
+    logger.info("=" * 60)
 
     # Parse parameters
     los_threshold = parse_los_threshold()
     icd_code = get_disease_icd_code()
 
-    print(f"Configuration:")
-    print(f"  - Version: {VERSION} (MIMIC-IV v3.1)")
-    print(f"  - Data Source: {DATA_SOURCE}")
-    print(f"  - LOS Threshold: {los_threshold} days")
-    print(f"  - Disease Filter: {DISEASE_FILTER}")
-    print(f"  - Diagnoses: Always included for ICU data")
+    logger.info(f"Configuration:")
+    logger.info(f"  - Version: {VERSION} (MIMIC-IV v3.1)")
+    logger.info(f"  - Data Source: {DATA_SOURCE}")
+    logger.info(f"  - LOS Threshold: {los_threshold} days")
+    logger.info(f"  - Disease Filter: {DISEASE_FILTER}")
+    logger.info(f"  - Diagnoses: Always included for ICU data")
 
     # Extract data using version 3 module
     try:
@@ -206,48 +306,92 @@ def extract_cohort():
             cohort_output=None,
             summary_output=None,
         )
-        print("Cohort extraction completed successfully")
-        print(f"Cohort saved as: {cohort_output}")
-        return cohort_output
+        logger.info("Cohort extraction completed successfully")
+        logger.info(f"Cohort saved as: {cohort_output}")
+        if USE_DATABASE_MODE:
+            return cohort_output, conn
+        else:
+            conn.close()
+            return cohort_output
     except Exception as e:
-        print(f"Error during cohort extraction: {e}")
+        logger.error(f"Error during cohort extraction: {e}")
         raise
 
 
-def feature_selection(cohort_output):
+def feature_selection(cohort_output, conn=None):
     """Perform ICU feature selection with diagnoses included"""
-    print("=" * 60)
-    print("STEP 2: ICU FEATURE SELECTION")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("STEP 2: ICU FEATURE SELECTION")
+    logger.info("=" * 60)
 
     version_path = get_version_path()
 
-    print(f"Processing features for ICU data from {version_path}...")
-    print(f"Selected features: {[k for k, v in FEATURE_FLAGS.items() if v]}")
-    print("Diagnoses: ENABLED (required for ICU)")
+    # Check feature availability
+    features_available = check_feature_availability()
+
+    # Update FEATURE_FLAGS based on availability
+    updated_flags = FEATURE_FLAGS.copy()
+    if not features_available["chart_events"]:
+        updated_flags["chart_events"] = False
+        logger.warning("Disabling chart events extraction - no itemids available")
+
+    if not features_available["output_events"]:
+        updated_flags["output_events"] = False
+        logger.warning("Disabling output events extraction - no itemids available")
+
+    if not features_available["medications"]:
+        updated_flags["medications"] = False
+        logger.warning("Disabling medications extraction - no itemids available")
+
+    if not features_available["procedures"]:
+        updated_flags["procedures"] = False
+        logger.warning("Disabling procedures extraction - no itemids available")
+
+    logger.info(f"Processing features for ICU data from {version_path}...")
+    logger.info(f"Selected features: {[k for k, v in updated_flags.items() if v]}")
+    logger.info("Diagnoses: ENABLED (required for ICU)")
 
     try:
+        mode_str = "database" if USE_DATABASE_MODE else "file"
+        logger.info(f"Running feature extraction in {mode_str} mode...")
+        if USE_DATABASE_MODE:
+            logger.info("Using DuckDB with CSV.gz cohort files for preprocessing")
+
         # ICU feature selection with diagnoses always enabled
-        MODULES["feature_icu"].feature_icu(
-            cohort_output=cohort_output,
-            version_path=version_path,
-            diag_flag=True,  # Always True for diagnoses
-            proc_flag=FEATURE_FLAGS["procedures"],
-            out_flag=FEATURE_FLAGS["output_events"],
-            chart_flag=FEATURE_FLAGS["chart_events"],
-            med_flag=FEATURE_FLAGS["medications"],
-        )
-        print("ICU feature selection completed successfully.")
+        if USE_DATABASE_MODE and conn:
+            # Use database-enabled feature extraction
+            MODULES["feature_icu"].feature_icu(
+                conn=conn,
+                cohort_output=cohort_output,
+                diag_flag=True,  # Always True for diagnoses
+                proc_flag=updated_flags["procedures"],
+                out_flag=updated_flags["output_events"],
+                chart_flag=updated_flags["chart_events"],
+                med_flag=updated_flags["medications"],
+            )
+        else:
+            # Use original file-based feature extraction
+            MODULES["feature_icu"].feature_icu(
+                cohort_output=cohort_output,
+                version_path=version_path,
+                diag_flag=True,  # Always True for diagnoses
+                proc_flag=updated_flags["procedures"],
+                out_flag=updated_flags["output_events"],
+                chart_flag=updated_flags["chart_events"],
+                med_flag=updated_flags["medications"],
+            )
+        logger.info("Feature selection completed successfully")
     except Exception as e:
-        print(f"Error during feature selection: {e}")
+        logger.error(f"Feature selection failed: {e}")
+        logger.error(f"Error during feature selection: {e}")
         raise
 
 
 def generate_time_series(cohort_output):
     """Generate ICU time series data"""
-    print("=" * 60)
-    print("STEP 3: ICU TIME SERIES GENERATION")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("STEP 3: ICU TIME SERIES GENERATION")
+    logger.info("=" * 60)
 
     # Parse time series parameters
     include_hours = parse_time_window()
@@ -259,13 +403,32 @@ def generate_time_series(cohort_output):
     data_mort = False
     data_admn = False
 
-    print(f"Time series configuration:")
-    print(f"  - Include: First {include_hours} hours")
-    print(f"  - Bucket size: {bucket_size} hour(s)")
-    print(f"  - Imputation: {impute_method}")
-    print("  - Task: Length of Stay prediction")
+    logger.info(f"Time series configuration:")
+    logger.info(f"  - Include: First {include_hours} hours")
+    logger.info(f"  - Bucket size: {bucket_size} hour(s)")
+    logger.info(f"  - Imputation: {impute_method}")
+    logger.info("  - Task: Length of Stay prediction")
 
     try:
+        # Check feature availability for time series generation
+        features_available = check_feature_availability()
+
+        # Update flags for time series generation
+        ts_flags = {
+            "procedures": FEATURE_FLAGS["procedures"]
+            and features_available["procedures"],
+            "output_events": FEATURE_FLAGS["output_events"]
+            and features_available["output_events"],
+            "chart_events": FEATURE_FLAGS["chart_events"]
+            and features_available["chart_events"],
+            "medications": FEATURE_FLAGS["medications"]
+            and features_available["medications"],
+        }
+
+        logger.info(
+            f"Time series generation using features: {[k for k, v in ts_flags.items() if v]}"
+        )
+
         # Create ICU time series generator
         gen = MODULES["data_gen_icu"].Generator(
             cohort_output=cohort_output,
@@ -273,27 +436,27 @@ def generate_time_series(cohort_output):
             if_admn=data_admn,
             if_los=data_los,
             feat_cond=True,  # Always True for diagnoses
-            feat_proc=FEATURE_FLAGS["procedures"],
-            feat_out=FEATURE_FLAGS["output_events"],
-            feat_chart=FEATURE_FLAGS["chart_events"],
-            feat_med=FEATURE_FLAGS["medications"],
+            feat_proc=ts_flags["procedures"],
+            feat_out=ts_flags["output_events"],
+            feat_chart=ts_flags["chart_events"],
+            feat_med=ts_flags["medications"],
             impute=impute_method,
             include_time=include_hours,
             bucket=bucket_size,
             predW=0,  # No prediction window for LOS
         )
-        print("ICU time series generation completed successfully.")
+        logger.info("ICU time series generation completed successfully.")
         return gen
     except Exception as e:
-        print(f"Error during time series generation: {e}")
+        logger.error(f"Error during time series generation: {e}")
         raise
 
 
 def generate_summary(cohort_output):
     """Generate data summary and statistics"""
-    print("=" * 60)
-    print("STEP 4: DATA SUMMARY")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("STEP 4: DATA SUMMARY")
+    logger.info("=" * 60)
 
     # Load cohort data
     cohort_path = f"./data/cohort/{cohort_output}.csv.gz"
@@ -301,27 +464,27 @@ def generate_summary(cohort_output):
         try:
             cohort_df = pd.read_csv(cohort_path, compression="gzip")
 
-            print("ICU Cohort Statistics:")
-            print(f"  - Total patients: {cohort_df['subject_id'].nunique()}")
-            print(f"  - Total ICU stays: {len(cohort_df)}")
-            print(
+            logger.info("ICU Cohort Statistics:")
+            logger.info(f"  - Total patients: {cohort_df['subject_id'].nunique()}")
+            logger.info(f"  - Total ICU stays: {len(cohort_df)}")
+            logger.info(
                 f"  - Positive cases (LOS > threshold): {(cohort_df['label'] == 1).sum()}"
             )
-            print(
+            logger.info(
                 f"  - Negative cases (LOS <= threshold): {(cohort_df['label'] == 0).sum()}"
             )
-            print(
+            logger.info(
                 f"  - Label distribution: {cohort_df['label'].value_counts().to_dict()}"
             )
 
             if "Age" in cohort_df.columns:
-                print(f"  - Mean age: {cohort_df['Age'].mean():.1f}")
-                print(
+                logger.info(f"  - Mean age: {cohort_df['Age'].mean():.1f}")
+                logger.info(
                     f"  - Age range: {cohort_df['Age'].min()}-{cohort_df['Age'].max()}"
                 )
 
             if "gender" in cohort_df.columns:
-                print(
+                logger.info(
                     f"  - Gender distribution: {cohort_df['gender'].value_counts().to_dict()}"
                 )
 
@@ -337,72 +500,82 @@ def generate_summary(cohort_output):
                 f.write(f"Total ICU stays: {len(cohort_df)}\n")
                 f.write(f"Positive cases: {(cohort_df['label'] == 1).sum()}\n")
                 f.write(f"Negative cases: {(cohort_df['label'] == 0).sum()}\n")
-            print(f"Summary saved to: {summary_path}")
+            logger.info(f"Summary saved to: {summary_path}")
 
         except Exception as e:
-            print(f"Error generating summary: {e}")
+            logger.error(f"Error generating summary: {e}")
     else:
-        print(f"Warning: Cohort file not found at {cohort_path}")
+        logger.warning(f"Warning: Cohort file not found at {cohort_path}")
 
-    print("Data processing completed successfully!")
-    print("Ready for model training with your preferred ML framework.")
+    logger.info("Data processing completed successfully!")
+    logger.info("Ready for model training with your preferred ML framework.")
 
 
 def main():
     """Main pipeline execution"""
-    print("MIMIC-IV v3 ICU Length of Stay Prediction Pipeline")
-    print("=" * 60)
-    print("Configuration:")
-    print(f"  Version: {VERSION} (MIMIC-IV v3.1)")
-    print(f"  Data Source: {DATA_SOURCE}")
-    print(f"  LOS Threshold: {LOS_THRESHOLD_TYPE}")
-    print(f"  Disease Filter: {DISEASE_FILTER}")
-    print(f"  Features: {[k for k, v in FEATURE_FLAGS.items() if v]}")
-    print(f"  Diagnoses: ALWAYS INCLUDED")
-    print(f"  Time Window: {TIME_WINDOW_TYPE}")
-    print(f"  Bucket Size: {BUCKET_SIZE_TYPE}")
-    print(f"  Imputation: {IMPUTATION_METHOD}")
-    print("=" * 60)
+    logger.info("MIMIC-IV v3 ICU Length of Stay Prediction Pipeline")
+    logger.info("=" * 60)
+    logger.info("Configuration:")
+    logger.info(f"  Version: {VERSION} (MIMIC-IV v3.1)")
+    logger.info(f"  Data Source: {DATA_SOURCE}")
+    logger.info(f"  LOS Threshold: {LOS_THRESHOLD_TYPE}")
+    logger.info(f"  Disease Filter: {DISEASE_FILTER}")
+    logger.info(f"  Features: {[k for k, v in FEATURE_FLAGS.items() if v]}")
+    logger.info(f"  Diagnoses: ALWAYS INCLUDED")
+    logger.info(f"  Time Window: {TIME_WINDOW_TYPE}")
+    logger.info(f"  Bucket Size: {BUCKET_SIZE_TYPE}")
+    logger.info(f"  Imputation: {IMPUTATION_METHOD}")
+    logger.info("=" * 60)
 
     try:
         # Step 1: Extract ICU cohort
-        cohort_output = extract_cohort()
+        if USE_DATABASE_MODE:
+            cohort_output, conn = extract_cohort()
+        else:
+            cohort_output = extract_cohort()
+            conn = None
 
-        # Step 2: ICU feature selection (with diagnoses)
-        feature_selection(cohort_output)
+        try:
+            # Step 2: ICU feature selection (with diagnoses)
+            feature_selection(cohort_output, conn)
 
-        # Step 3: Generate ICU time series
-        generate_time_series(cohort_output)
+            # Step 3: Generate ICU time series
+            generate_time_series(cohort_output)
 
-        # Step 4: Generate summary
-        generate_summary(cohort_output)
+            # Step 4: Generate summary
+            generate_summary(cohort_output)
+        finally:
+            # Clean up database connection if it exists
+            if conn and USE_DATABASE_MODE:
+                conn.close()
+                logger.info("Database connection closed")
 
-        print("=" * 60)
-        print("ICU DATA PREPROCESSING COMPLETED SUCCESSFULLY!")
-        print("=" * 60)
-        print("Output files:")
-        print(f"  - Cohort: ./data/cohort/{cohort_output}.csv.gz")
-        print("  - Features: ./data/features/preproc_*.csv.gz")
-        print("  - Time series: ./data/dict/ and ./data/csv/")
-        print(f"  - Summary: ./data/summary/{cohort_output}_summary.txt")
-        print("=" * 60)
-        print("Data includes:")
-        print("  - ICU stays from MIMIC-IV v3.1")
-        print("  - Diagnosis codes (ICD-9/ICD-10)")
-        print("  - Procedures, medications, chart events, output events")
-        print("  - Time-series features with configurable bucketing")
-        print("=" * 60)
-        print("Next steps:")
-        print("  - Use ./data/csv/labels.csv for training labels")
-        print("  - Use ./data/csv/{patient_id}/ files for patient features")
-        print("  - Load ./data/dict/ files for vocabulary and metadata")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("ICU DATA PREPROCESSING COMPLETED SUCCESSFULLY!")
+        logger.info("=" * 60)
+        logger.info("Output files:")
+        logger.info(f"  - Cohort: ./data/cohort/{cohort_output}.csv.gz")
+        logger.info("  - Features: ./data/features/preproc_*.csv.gz")
+        logger.info("  - Time series: ./data/dict/ and ./data/csv/")
+        logger.info(f"  - Summary: ./data/summary/{cohort_output}_summary.txt")
+        logger.info("=" * 60)
+        logger.info("Data includes:")
+        logger.info("  - ICU stays from MIMIC-IV v3.1")
+        logger.info("  - Diagnosis codes (ICD-9/ICD-10)")
+        logger.info("  - Procedures, medications, chart events, output events")
+        logger.info("  - Time-series features with configurable bucketing")
+        logger.info("=" * 60)
+        logger.info("Next steps:")
+        logger.info("  - Use ./data/csv/labels.csv for training labels")
+        logger.info("  - Use ./data/csv/{patient_id}/ files for patient features")
+        logger.info("  - Load ./data/dict/ files for vocabulary and metadata")
+        logger.info("=" * 60)
 
     except Exception as e:
-        print(f"ERROR: Pipeline failed with exception: {e}")
+        logger.error(f"ERROR: Pipeline failed with exception: {e}")
         import traceback
 
-        traceback.print_exc()
+        logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
 
@@ -422,14 +595,16 @@ if __name__ == "__main__":
     # Verify MIMIC-IV v3.1 data path exists
     mimic_path = "./mimiciv/3.1"
     if not os.path.exists(mimic_path):
-        print(f"WARNING: MIMIC-IV v3.1 data path not found: {mimic_path}")
-        print("Please ensure MIMIC-IV v3.1 data is available at the expected location.")
-        print("Expected structure:")
-        print("  ./mimiciv/3.1/icu/icustays.csv.gz")
-        print("  ./mimiciv/3.1/hosp/patients.csv.gz")
-        print("  ./mimiciv/3.1/hosp/diagnoses_icd.csv.gz")
-        print("  ... (other MIMIC-IV files)")
-        print("")
+        logger.warning(f"MIMIC-IV v3.1 data path not found: {mimic_path}")
+        logger.warning(
+            "Please ensure MIMIC-IV v3.1 data is available at the expected location."
+        )
+        logger.warning("Expected structure:")
+        logger.warning("  ./mimiciv/3.1/icu/icustays.csv.gz")
+        logger.warning("  ./mimiciv/3.1/hosp/patients.csv.gz")
+        logger.warning("  ./mimiciv/3.1/hosp/diagnoses_icd.csv.gz")
+        logger.warning("  ... (other MIMIC-IV files)")
+        logger.warning("")
 
     # Run main pipeline
     main()
