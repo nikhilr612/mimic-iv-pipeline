@@ -4,17 +4,27 @@ import sys, os
 import re
 import ast
 import datetime as dt
+import logging
+from typing import Dict, Optional, Set
 from tqdm import tqdm
 
 from sklearn.preprocessing import MultiLabelBinarizer
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 
 ########################## ITEMID FILTERING ##########################
-# Global variables to store whitelisted itemids for different data types
-_CHART_ITEMIDS = None
-_MED_ITEMIDS = None
-_PROC_ITEMIDS = None
-_OUTPUT_ITEMIDS = None
+# Global mutable container to store whitelisted itemids for different data types
+_ITEMID_WHITELISTS: Dict[str, Optional[Set[int]]] = {
+    "chart": None,
+    "med": None,
+    "proc": None,
+    "output": None,
+}
 
 
 def load_itemid_whitelist(data_type="chart", filepath=None):
@@ -24,7 +34,9 @@ def load_itemid_whitelist(data_type="chart", filepath=None):
         data_type: "chart", "med", "proc", or "output"
         filepath: Custom file path, or None to use defaults
     """
-    global _CHART_ITEMIDS, _MED_ITEMIDS, _PROC_ITEMIDS, _OUTPUT_ITEMIDS
+    global _ITEMID_WHITELISTS
+
+    logger.info(f"[ITEMID] Loading {data_type} itemid whitelist...")
 
     if filepath is None:
         # Try default locations for each data type
@@ -54,12 +66,14 @@ def load_itemid_whitelist(data_type="chart", filepath=None):
             for path in generic_paths:
                 if os.path.exists(path):
                     filepath = path
-                    print(f"Using generic itemid whitelist for {data_type}: {filepath}")
+                    logger.info(
+                        f"Using generic itemid whitelist for {data_type}: {filepath}"
+                    )
                     break
 
     if filepath is None or not os.path.exists(filepath):
-        print(
-            f"Warning: No itemid whitelist file found for {data_type}. Including all itemids."
+        logger.warning(
+            f"No itemid whitelist file found for {data_type}. Including all itemids - no filtering will be applied."
         )
         return None
 
@@ -72,45 +86,40 @@ def load_itemid_whitelist(data_type="chart", filepath=None):
                     try:
                         itemids.append(int(line))
                     except ValueError:
-                        print(
-                            f"Warning: Invalid itemid '{line}' in {data_type} whitelist"
+                        logger.warning(
+                            f"Invalid itemid '{line}' in {data_type} whitelist - skipping"
                         )
 
         itemid_set = set(itemids) if itemids else None
 
-        # Store in appropriate global variable
-        if data_type == "chart":
-            _CHART_ITEMIDS = itemid_set
-        elif data_type == "med":
-            _MED_ITEMIDS = itemid_set
-        elif data_type == "proc":
-            _PROC_ITEMIDS = itemid_set
-        elif data_type == "output":
-            _OUTPUT_ITEMIDS = itemid_set
+        # Warn if filter is empty
+        if not itemids:
+            logger.warning(
+                f"Empty itemid whitelist loaded for {data_type} - no filtering will be applied"
+            )
 
-        print(f"Loaded {len(itemids)} {data_type} itemids from: {filepath}")
+        # Store in global container by mutating in-place
+        _ITEMID_WHITELISTS[data_type] = itemid_set
+
+        logger.info(
+            f"[ITEMID] Loaded {len(itemids)} {data_type} itemids from: {filepath}"
+        )
         return itemid_set
     except Exception as e:
-        print(f"Error loading {data_type} itemid whitelist from {filepath}: {e}")
+        logger.error(f"Error loading {data_type} itemid whitelist from {filepath}: {e}")
         return None
 
 
 def get_itemid_whitelist(data_type="chart"):
     """Get the current itemid whitelist for specified data type."""
-    global _CHART_ITEMIDS, _MED_ITEMIDS, _PROC_ITEMIDS, _OUTPUT_ITEMIDS
+    global _ITEMID_WHITELISTS
 
-    whitelist_map = {
-        "chart": _CHART_ITEMIDS,
-        "med": _MED_ITEMIDS,
-        "proc": _PROC_ITEMIDS,
-        "output": _OUTPUT_ITEMIDS,
-    }
-
-    current_whitelist = whitelist_map.get(data_type)
+    current_whitelist = _ITEMID_WHITELISTS.get(data_type)
     if current_whitelist is None:
         # Try to load it
         load_itemid_whitelist(data_type)
-        current_whitelist = whitelist_map.get(data_type)
+        # Get updated value after loading
+        current_whitelist = _ITEMID_WHITELISTS.get(data_type)
 
     return current_whitelist
 
@@ -119,6 +128,9 @@ def get_itemid_filter_clause(data_type="chart", itemid_col="itemid"):
     """Get SQL WHERE clause for itemid filtering. Returns empty string if no filtering."""
     whitelist = get_itemid_whitelist(data_type)
     if whitelist is None or len(whitelist) == 0:
+        logger.warning(
+            f"No {data_type} itemid filter available - query will include all itemids"
+        )
         return ""
 
     itemid_list = ",".join(str(id) for id in sorted(whitelist))
@@ -129,11 +141,14 @@ def filter_by_itemid(df, data_type="chart", itemid_col="itemid"):
     """Filter dataframe by whitelisted itemids if whitelist is available."""
     whitelist = get_itemid_whitelist(data_type)
     if whitelist is None:
+        logger.warning(
+            f"No {data_type} itemid filter available - returning unfiltered dataframe"
+        )
         return df
 
     if itemid_col not in df.columns:
-        print(
-            f"Warning: Column '{itemid_col}' not found. Skipping {data_type} itemid filtering."
+        logger.warning(
+            f"Column '{itemid_col}' not found. Skipping {data_type} itemid filtering."
         )
         return df
 
@@ -141,8 +156,8 @@ def filter_by_itemid(df, data_type="chart", itemid_col="itemid"):
     df_filtered = df[df[itemid_col].isin(whitelist)]
     filtered_count = len(df_filtered)
 
-    print(
-        f"{data_type.title()} itemid filtering: {original_count} -> {filtered_count} rows ({original_count - filtered_count} removed)"
+    logger.info(
+        f"[FILTER] {data_type.title()} itemid filtering: {original_count} -> {filtered_count} rows ({original_count - filtered_count} removed)"
     )
     return df_filtered
 
@@ -156,14 +171,17 @@ def load_all_itemid_whitelists():
         whitelist = load_itemid_whitelist(data_type)
         loaded[data_type] = len(whitelist) if whitelist else 0
 
-    print(f"Itemid whitelists loaded: {loaded}")
+    logger.info(f"[ITEMID] Itemid whitelists loaded: {loaded}")
     return loaded
 
 
 ########################## GENERAL ##########################
 def dataframe_from_query(conn, query):
     """Execute a DuckDB query and return a pandas DataFrame"""
-    return conn.execute(query).df()
+    logger.info(f"[QUERY] Executing query...")
+    df = conn.execute(query).df()
+    logger.info(f"[QUERY] Query returned DataFrame with shape: {df.shape}")
+    return df
 
 
 def load_cohort_from_csv_gz(conn, csv_gz_path, table_name="cohort_temp"):
@@ -186,19 +204,20 @@ def load_cohort_from_csv_gz(conn, csv_gz_path, table_name="cohort_temp"):
         raise FileNotFoundError(f"CSV.gz file not found: {csv_gz_path}")
 
     try:
-        print(
-            f"Loading cohort data from {csv_gz_path} into temporary table '{table_name}'..."
+        logger.info(
+            f"[COHORT] Loading cohort data from {csv_gz_path} into temporary table '{table_name}'..."
         )
 
         # Drop the table if it already exists
         conn.execute(f"DROP TABLE IF EXISTS {table_name}")
 
         # Load CSV.gz using pandas first for better compatibility
-        print("Reading CSV.gz file with pandas...")
+        logger.info("[COHORT] Reading CSV.gz file with pandas...")
         df = pd.read_csv(csv_gz_path, compression="gzip")
+        logger.info(f"[COHORT] CSV DataFrame loaded with shape: {df.shape}")
 
         if df.empty:
-            print("Warning: CSV file is empty")
+            logger.warning("[COHORT] CSV file is empty")
             # Create empty table with basic structure
             conn.execute(f"""
                 CREATE TABLE {table_name} (
@@ -221,14 +240,16 @@ def load_cohort_from_csv_gz(conn, csv_gz_path, table_name="cohort_temp"):
         row_count = count_result[0] if count_result else 0
 
         if row_count == 0:
-            print(f"Warning: No data loaded from {csv_gz_path}")
+            logger.warning(f"[COHORT] No data loaded from {csv_gz_path}")
         else:
-            print(f"Successfully loaded {row_count} rows into table '{table_name}'")
+            logger.info(
+                f"[COHORT] Successfully loaded {row_count} rows into table '{table_name}'"
+            )
 
         # Show table schema for debugging
         schema_result = conn.execute(f"DESCRIBE {table_name}").df()
-        print(f"Table schema:")
-        print(schema_result.to_string(index=False))
+        logger.info(f"[COHORT] Table schema:")
+        logger.info(schema_result.to_string(index=False))
 
         # Validate required columns for cohort data
         required_columns = ["stay_id", "intime"]
@@ -236,15 +257,17 @@ def load_cohort_from_csv_gz(conn, csv_gz_path, table_name="cohort_temp"):
         missing_columns = [col for col in required_columns if col not in columns]
 
         if missing_columns:
-            print(f"Warning: Missing recommended cohort columns: {missing_columns}")
-            print(
-                "Expected columns for ICU cohort: stay_id, subject_id, hadm_id, intime, outtime"
+            logger.warning(
+                f"[COHORT] Missing recommended cohort columns: {missing_columns}"
+            )
+            logger.warning(
+                "[COHORT] Expected columns for ICU cohort: stay_id, subject_id, hadm_id, intime, outtime"
             )
 
         return table_name
 
     except Exception as e:
-        print(f"Error loading cohort data from {csv_gz_path}: {str(e)}")
+        logger.error(f"[COHORT] Error loading cohort data from {csv_gz_path}: {str(e)}")
         # Try to clean up if table creation failed
         try:
             conn.execute(f"DROP TABLE IF EXISTS {table_name}")
@@ -266,8 +289,8 @@ def load_cohort_from_dataframe(conn, df, table_name="cohort_temp"):
         str: The table name that was created
     """
     try:
-        print(
-            f"Loading cohort data from DataFrame into temporary table '{table_name}'..."
+        logger.info(
+            f"[COHORT] Loading cohort data from DataFrame (shape: {df.shape}) into temporary table '{table_name}'..."
         )
 
         # Drop the table if it already exists
@@ -275,7 +298,7 @@ def load_cohort_from_dataframe(conn, df, table_name="cohort_temp"):
 
         # Check if DataFrame is empty
         if df.empty:
-            print("Warning: DataFrame is empty, creating table with no rows")
+            logger.warning("[COHORT] DataFrame is empty, creating table with no rows")
             # Create an empty table with basic columns
             conn.execute(f"""
                 CREATE TABLE {table_name} (
@@ -296,17 +319,19 @@ def load_cohort_from_dataframe(conn, df, table_name="cohort_temp"):
             row_count = 0
         else:
             row_count = len(df)
-        print(f"Successfully loaded {row_count} rows into table '{table_name}'")
+        logger.info(
+            f"[COHORT] Successfully loaded {row_count} rows into table '{table_name}'"
+        )
 
         # Show table schema for debugging
         schema_result = conn.execute(f"DESCRIBE {table_name}").df()
-        print(f"Table schema:")
-        print(schema_result.to_string(index=False))
+        logger.info(f"[COHORT] Table schema:")
+        logger.info(schema_result.to_string(index=False))
 
         return table_name
 
     except Exception as e:
-        print(f"Error loading cohort data from DataFrame: {str(e)}")
+        logger.error(f"[COHORT] Error loading cohort data from DataFrame: {str(e)}")
         raise
 
 
@@ -339,22 +364,33 @@ def preproc_with_csv_cohort(
     Returns:
         pd.DataFrame: Preprocessed data
     """
+    logger.info(
+        f"[PREPROC] Starting preprocessing with CSV cohort for data type: {data_type}"
+    )
+
     # Load cohort data from CSV.gz into temporary table
     cohort_table = load_cohort_from_csv_gz(conn, csv_gz_path, cohort_table_name)
 
     # Preprocess data based on type
     if data_type == "chart":
-        return preproc_chart(conn, chart_table_name, cohort_table, time_col, chunksize)
+        result = preproc_chart(
+            conn, chart_table_name, cohort_table, time_col, chunksize
+        )
     elif data_type == "med":
-        return preproc_meds(conn, cohort_table)
+        result = preproc_meds(conn, cohort_table)
     elif data_type == "proc":
-        return preproc_proc(conn, procedure_table_name, cohort_table, time_col)
+        result = preproc_proc(conn, procedure_table_name, cohort_table, time_col)
     elif data_type == "output":
-        return preproc_out(conn, output_table_name, cohort_table, time_col)
+        result = preproc_out(conn, output_table_name, cohort_table, time_col)
     else:
         raise ValueError(
             f"Unsupported data_type: {data_type}. Supported types: 'chart', 'med', 'proc', 'output'"
         )
+
+    logger.info(
+        f"[PREPROC] Completed preprocessing, final result shape: {result.shape}"
+    )
+    return result
 
 
 def cleanup_cohort_table(conn, table_name="cohort_temp"):
@@ -371,13 +407,14 @@ def cleanup_cohort_table(conn, table_name="cohort_temp"):
             conn.execute(f"DROP TABLE IF EXISTS {table_name}")
         except:
             conn.execute(f"DROP VIEW IF EXISTS {table_name}")
-        print(f"Successfully cleaned up temporary table '{table_name}'")
+        logger.info(f"[CLEANUP] Successfully cleaned up temporary table '{table_name}'")
     except Exception as e:
-        print(f"Warning: Could not clean up table '{table_name}': {str(e)}")
+        logger.warning(f"[CLEANUP] Could not clean up table '{table_name}': {str(e)}")
 
 
 def read_admissions_table(conn):
     """Read admissions table from DuckDB with appropriate type casting"""
+    logger.info("[ADMISSIONS] Reading admissions table...")
     query = """
     SELECT
         CAST(subject_id AS INTEGER) as subject_id,
@@ -395,11 +432,13 @@ def read_admissions_table(conn):
     admits.admittime = pd.to_datetime(admits.admittime)
     admits.dischtime = pd.to_datetime(admits.dischtime)
     admits.deathtime = pd.to_datetime(admits.deathtime)
+    logger.info(f"[ADMISSIONS] Loaded admissions data with shape: {admits.shape}")
     return admits
 
 
 def read_patients_table(conn):
     """Read patients table from DuckDB with appropriate type casting"""
+    logger.info("[PATIENTS] Reading patients table...")
     query = """
     SELECT
         CAST(subject_id AS INTEGER) as subject_id,
@@ -423,12 +462,14 @@ def read_patients_table(conn):
     ]
     pats["yob"] = pats["anchor_year"] - pats["anchor_age"]
     pats.dod = pd.to_datetime(pats.dod)
+    logger.info(f"[PATIENTS] Loaded patients data with shape: {pats.shape}")
     return pats
 
 
 ########################## DIAGNOSES ##########################
 def read_diagnoses_icd_table(conn):
     """Read diagnoses_icd table from DuckDB with appropriate type casting"""
+    logger.info("[DIAGNOSES] Reading diagnoses_icd table...")
     query = """
     SELECT
         CAST(subject_id AS INTEGER) as subject_id,
@@ -439,11 +480,13 @@ def read_diagnoses_icd_table(conn):
     FROM diagnoses_icd
     """
     diag = dataframe_from_query(conn, query)
+    logger.info(f"[DIAGNOSES] Loaded diagnoses_icd data with shape: {diag.shape}")
     return diag
 
 
 def read_d_icd_diagnoses_table(conn):
     """Read d_icd_diagnoses table from DuckDB"""
+    logger.info("[DIAGNOSES] Reading d_icd_diagnoses table...")
     query = """
     SELECT
         icd_code,
@@ -451,21 +494,32 @@ def read_d_icd_diagnoses_table(conn):
     FROM d_icd_diagnoses
     """
     d_icd = dataframe_from_query(conn, query)
-    return d_icd[["icd_code", "long_title"]]
+    result = d_icd[["icd_code", "long_title"]]
+    logger.info(f"[DIAGNOSES] Loaded d_icd_diagnoses data with shape: {result.shape}")
+    return result
 
 
 def read_diagnoses(conn):
     """Read and merge diagnoses tables"""
-    return read_diagnoses_icd_table(conn).merge(
-        read_d_icd_diagnoses_table(conn),
+    logger.info("[DIAGNOSES] Reading and merging diagnoses tables...")
+    diag_icd = read_diagnoses_icd_table(conn)
+    d_icd = read_d_icd_diagnoses_table(conn)
+
+    result = diag_icd.merge(
+        d_icd,
         how="inner",
         left_on=["icd_code"],
         right_on=["icd_code"],
     )
+    logger.info(f"[DIAGNOSES] Merged diagnoses data with shape: {result.shape}")
+    return result
 
 
 def standardize_icd(mapping, df, root=False):
     """Takes an ICD9 -> ICD10 mapping table and a diagnosis dataframe; adds column with converted ICD10 column"""
+    logger.info(
+        f"[ICD] Standardizing ICD codes (root={root}), input DataFrame shape: {df.shape}"
+    )
 
     def icd_9to10(icd):
         # If root is true, only map an ICD 9 -> 10 according to the ICD9's root (first 3 digits)
@@ -475,7 +529,7 @@ def standardize_icd(mapping, df, root=False):
             # Many ICD-9's do not have a 1-to-1 mapping; get first index of mapped codes
             return mapping.loc[mapping.diagnosis_code == icd].icd10cm.iloc[0]
         except:
-            print("Error on code", icd)
+            logger.error(f"Error on code {icd}")
             return np.nan
 
     # Create new column with original codes as default
@@ -485,16 +539,22 @@ def standardize_icd(mapping, df, root=False):
     df[col_name] = df["icd_code"].values
 
     # Group identical ICD9 codes, then convert all ICD9 codes within a group to ICD10
+    icd9_codes = df.loc[df.icd_version == 9]["icd_code"].nunique()
+    logger.info(f"[ICD] Converting {icd9_codes} unique ICD-9 codes to ICD-10...")
+
     for code, group in df.loc[df.icd_version == 9].groupby(by="icd_code"):
         new_code = icd_9to10(code)
         for idx in group.index.values:
             # Modify values of original df at the indexes in the groups
             df.at[idx, col_name] = new_code
 
+    logger.info(f"[ICD] ICD standardization complete, DataFrame shape: {df.shape}")
+
 
 ########################## PROCEDURES ##########################
 def read_procedures_icd_table(conn):
     """Read procedures_icd table from DuckDB with appropriate type casting"""
+    logger.info("[PROCEDURES] Reading procedures_icd table...")
     query = """
     SELECT
         CAST(subject_id AS INTEGER) as subject_id,
@@ -505,11 +565,13 @@ def read_procedures_icd_table(conn):
     FROM procedures_icd
     """
     proc = dataframe_from_query(conn, query)
+    logger.info(f"[PROCEDURES] Loaded procedures_icd data with shape: {proc.shape}")
     return proc
 
 
 def read_d_icd_procedures_table(conn):
     """Read d_icd_procedures table from DuckDB"""
+    logger.info("[PROCEDURES] Reading d_icd_procedures table...")
     query = """
     SELECT
         icd_code,
@@ -517,24 +579,34 @@ def read_d_icd_procedures_table(conn):
     FROM d_icd_procedures
     """
     p_icd = dataframe_from_query(conn, query)
-    return p_icd[["icd_code", "long_title"]]
+    result = p_icd[["icd_code", "long_title"]]
+    logger.info(f"[PROCEDURES] Loaded d_icd_procedures data with shape: {result.shape}")
+    return result
 
 
 def read_procedures(conn):
     """Read and merge procedures tables"""
-    return read_procedures_icd_table(conn).merge(
-        read_d_icd_procedures_table(conn),
+    logger.info("[PROCEDURES] Reading and merging procedures tables...")
+    proc_icd = read_procedures_icd_table(conn)
+    d_icd = read_d_icd_procedures_table(conn)
+
+    result = proc_icd.merge(
+        d_icd,
         how="inner",
         left_on=["icd_code"],
         right_on=["icd_code"],
     )
+    logger.info(f"[PROCEDURES] Merged procedures data with shape: {result.shape}")
+    return result
 
 
 ########################## MAPPING ##########################
 def read_icd_mapping(map_path):
     """Read ICD mapping from CSV file (unchanged from original)"""
+    logger.info(f"[MAPPING] Reading ICD mapping from: {map_path}")
     mapping = pd.read_csv(map_path, header=0, delimiter="\t")
     mapping.diagnosis_description = mapping.diagnosis_description.apply(str.lower)
+    logger.info(f"[MAPPING] Loaded ICD mapping with shape: {mapping.shape}")
     return mapping
 
 
@@ -543,6 +615,9 @@ def read_icd_mapping(map_path):
 
 def preproc_meds(conn, adm_cohort_table_name: str) -> pd.DataFrame:
     """Preprocess medications data using DuckDB tables with medication-specific itemid filtering"""
+    logger.info(
+        f"[MEDS] Starting medication preprocessing with cohort table: {adm_cohort_table_name}"
+    )
 
     # Get admissions cohort data
     adm_query = f"""
@@ -554,9 +629,19 @@ def preproc_meds(conn, adm_cohort_table_name: str) -> pd.DataFrame:
     """
     adm = dataframe_from_query(conn, adm_query)
     adm["intime"] = pd.to_datetime(adm["intime"])
+    logger.info(f"[MEDS] Admissions cohort loaded with shape: {adm.shape}")
 
     # Get medications data with medication-specific itemid filtering
     med_itemid_filter = get_itemid_filter_clause("med", "itemid")
+    if med_itemid_filter:
+        logger.info(
+            f"[MEDS] Applying medication itemid filter: {med_itemid_filter[:100]}..."
+        )
+    else:
+        logger.warning(
+            "[MEDS] No medication itemid filter applied - including all medication itemids"
+        )
+
     med_query = f"""
     SELECT
         CAST(subject_id AS INTEGER) as subject_id,
@@ -573,15 +658,19 @@ def preproc_meds(conn, adm_cohort_table_name: str) -> pd.DataFrame:
     med = dataframe_from_query(conn, med_query)
     med["starttime"] = pd.to_datetime(med["starttime"])
     med["endtime"] = pd.to_datetime(med["endtime"])
+    logger.info(f"[MEDS] Raw medications data loaded with shape: {med.shape}")
 
     med = med.merge(adm, left_on="stay_id", right_on="stay_id", how="inner")
+    logger.info(f"[MEDS] After merging with cohort, shape: {med.shape}")
+
     med["start_hours_from_admit"] = med["starttime"] - med["intime"]
     med["stop_hours_from_admit"] = med["endtime"] - med["intime"]
 
     med = med.dropna()
-    print("# of unique type of drug: ", med.itemid.nunique())
-    print("# Admissions:  ", med.stay_id.nunique())
-    print("# Total rows", med.shape[0])
+    logger.info(f"[MEDS] After dropping nulls, final shape: {med.shape}")
+    logger.info(f"[MEDS] # of unique type of drug: {med.itemid.nunique()}")
+    logger.info(f"[MEDS] # Admissions: {med.stay_id.nunique()}")
+    logger.info(f"[MEDS] # Total rows: {med.shape[0]}")
 
     return med
 
@@ -590,9 +679,21 @@ def preproc_proc(
     conn, procedure_table_name: str, cohort_table_name: str, time_col: str
 ) -> pd.DataFrame:
     """Function for getting procedure observations pertaining to a cohort using DuckDB with procedure-specific itemid filtering"""
+    logger.info(
+        f"[PROC] Starting procedure preprocessing with table: {procedure_table_name}, cohort: {cohort_table_name}"
+    )
 
     # Build the query to join procedures with cohort and procedure-specific itemid filtering
     proc_itemid_filter = get_itemid_filter_clause("proc", "p.itemid")
+    if proc_itemid_filter:
+        logger.info(
+            f"[PROC] Applying procedure itemid filter: {proc_itemid_filter[:100]}..."
+        )
+    else:
+        logger.warning(
+            "[PROC] No procedure itemid filter applied - including all procedure itemids"
+        )
+
     query = f"""
     SELECT
         p.subject_id,
@@ -612,12 +713,14 @@ def preproc_proc(
     df_cohort["intime"] = pd.to_datetime(df_cohort["intime"])
     df_cohort["outtime"] = pd.to_datetime(df_cohort["outtime"])
     df_cohort["event_time_from_admit"] = df_cohort[time_col] - df_cohort["intime"]
+    logger.info(f"[PROC] After merging and time calculation, shape: {df_cohort.shape}")
 
     df_cohort = df_cohort.dropna()
+    logger.info(f"[PROC] After dropping nulls, final shape: {df_cohort.shape}")
 
-    print("# Unique Events:  ", df_cohort.itemid.dropna().nunique())
-    print("# Admissions:  ", df_cohort.stay_id.nunique())
-    print("Total rows", df_cohort.shape[0])
+    logger.info(f"[PROC] # Unique Events: {df_cohort.itemid.dropna().nunique()}")
+    logger.info(f"[PROC] # Admissions: {df_cohort.stay_id.nunique()}")
+    logger.info(f"[PROC] Total rows: {df_cohort.shape[0]}")
 
     return df_cohort
 
@@ -626,9 +729,21 @@ def preproc_out(
     conn, output_table_name: str, cohort_table_name: str, time_col: str
 ) -> pd.DataFrame:
     """Function for getting output observations pertaining to a cohort using DuckDB with output-specific itemid filtering"""
+    logger.info(
+        f"[OUTPUT] Starting output preprocessing with table: {output_table_name}, cohort: {cohort_table_name}"
+    )
 
     # Build the query to join outputs with cohort and output-specific itemid filtering
     output_itemid_filter = get_itemid_filter_clause("output", "o.itemid")
+    if output_itemid_filter:
+        logger.info(
+            f"[OUTPUT] Applying output itemid filter: {output_itemid_filter[:100]}..."
+        )
+    else:
+        logger.warning(
+            "[OUTPUT] No output itemid filter applied - including all output itemids"
+        )
+
     query = f"""
     SELECT
         CAST(o.stay_id AS INTEGER) as stay_id,
@@ -647,14 +762,21 @@ def preproc_out(
     df_cohort["intime"] = pd.to_datetime(df_cohort["intime"])
     df_cohort["outtime"] = pd.to_datetime(df_cohort["outtime"])
     df_cohort["event_time_from_admit"] = df_cohort[time_col] - df_cohort["intime"]
+    logger.info(
+        f"[OUTPUT] After merging and time calculation, shape: {df_cohort.shape}"
+    )
 
     df_cohort = df_cohort.dropna()
+    logger.info(f"[OUTPUT] After dropping nulls, final shape: {df_cohort.shape}")
 
-    print("# Unique Events:  ", df_cohort.itemid.nunique())
-    print("# Admissions:  ", df_cohort.stay_id.nunique())
-    print("Total rows", df_cohort.shape[0])
+    logger.info(f"[OUTPUT] # Unique Events: {df_cohort.itemid.nunique()}")
+    logger.info(f"[OUTPUT] # Admissions: {df_cohort.stay_id.nunique()}")
+    logger.info(f"[OUTPUT] Total rows: {df_cohort.shape[0]}")
 
     return df_cohort
+
+
+EVENT_TIME_ALLOWED_HOURS = 24  # Keep only events within 24 hours of admission
 
 
 def preproc_chart(
@@ -665,6 +787,9 @@ def preproc_chart(
     chunksize: int = 10000000,
 ) -> pd.DataFrame:
     """Function for getting chart observations pertaining to a cohort using DuckDB with chunked processing and chart-specific itemid filtering"""
+    logger.info(
+        f"[CHART] Starting chart preprocessing with table: {chart_table_name}, cohort: {cohort_table_name}"
+    )
 
     # Get cohort data first
     cohort_query = f"""
@@ -675,12 +800,22 @@ def preproc_chart(
     """
     cohort = dataframe_from_query(conn, cohort_query)
     cohort["intime"] = pd.to_datetime(cohort["intime"])
+    logger.info(f"[CHART] Cohort data loaded with shape: {cohort.shape}")
 
     # Process chart events in chunks
     df_cohort = pd.DataFrame()
 
     # Get total count for progress tracking with chart-specific itemid filtering
     chart_itemid_filter = get_itemid_filter_clause("chart", "c.itemid")
+    if chart_itemid_filter:
+        logger.info(
+            f"[CHART] Applying chart itemid filter: {chart_itemid_filter[:100]}..."
+        )
+    else:
+        logger.warning(
+            "[CHART] No chart itemid filter applied - including all chart itemids"
+        )
+
     count_query = f"""
     SELECT COUNT(*) as total_rows
     FROM {chart_table_name} c
@@ -688,6 +823,7 @@ def preproc_chart(
     WHERE c.valuenum IS NOT NULL AND c.valuenum != '' {chart_itemid_filter}
     """
     total_rows = dataframe_from_query(conn, count_query)["total_rows"].iloc[0]
+    logger.info(f"[CHART] Total rows to process: {total_rows}")
 
     # Execute query directly without chunking since DuckDB's df() handles streaming efficiently
     query = f"""
@@ -697,6 +833,7 @@ def preproc_chart(
             CAST(c.itemid AS INTEGER) as itemid,
             CAST(c.{time_col} AS TIMESTAMP) as {time_col},
             CAST(c.valuenum AS DOUBLE) as valuenum,
+            c.valueuom,
             CAST(coh.intime AS TIMESTAMP) as intime
         FROM {chart_table_name} c
         INNER JOIN {cohort_table_name} coh ON c.stay_id = coh.stay_id
@@ -707,19 +844,22 @@ def preproc_chart(
             stay_id,
             itemid,
             valuenum,
+            valueuom,
             ({time_col} - intime) as event_time_from_admit
         FROM chart_data
         WHERE valuenum IS NOT NULL
     )
     SELECT * FROM processed_data
+    WHERE event_time_from_admit BETWEEN INTERVAL '0 hours' AND INTERVAL '{EVENT_TIME_ALLOWED_HOURS} hours'
     ORDER BY stay_id, itemid
     """
 
+    logger.debug(f"[DEBUG] query=\n {query}")
     df_cohort = dataframe_from_query(conn, query)
 
-    print("# Unique Events:  ", df_cohort.itemid.nunique())
-    print("# Admissions:  ", df_cohort.stay_id.nunique())
-    print("Total rows", df_cohort.shape[0])
+    logger.info(f"[CHART] # Unique Events: {df_cohort.itemid.nunique()}")
+    logger.info(f"[CHART] # Admissions: {df_cohort.stay_id.nunique()}")
+    logger.info(f"[CHART] Total rows: {df_cohort.shape[0]}")
 
     return df_cohort
 
@@ -788,24 +928,20 @@ def preproc_icd_module(
     if icd_map_path:
         icd_map = read_icd_mapping(icd_map_path)
         standardize_icd(icd_map, module, root=True)
-        print(
-            "# unique ICD-9 codes",
-            module[module["icd_version"] == 9]["icd_code"].nunique(),
+        logger.info(
+            f"[ICD] # unique ICD-9 codes: {module[module['icd_version'] == 9]['icd_code'].nunique()}"
         )
-        print(
-            "# unique ICD-10 codes",
-            module[module["icd_version"] == 10]["icd_code"].nunique(),
+        logger.info(
+            f"[ICD] # unique ICD-10 codes: {module[module['icd_version'] == 10]['icd_code'].nunique()}"
         )
-        print(
-            "# unique ICD-10 codes (After converting ICD-9 to ICD-10)",
-            module["root_icd10_convert"].nunique(),
+        logger.info(
+            f"[ICD] # unique converted ICD-10 codes: {module['root_icd10_convert'].nunique()}"
         )
-        print(
-            "# unique ICD-10 codes (After clinical grouping ICD-10 codes)",
-            module["root"].nunique(),
+        logger.info(
+            f"[ICD] # unique ICD-10 codes (After clinical grouping ICD-10 codes): {module['root'].nunique()}"
         )
-        print("# Admissions:  ", module.stay_id.nunique())
-        print("Total rows", module.shape[0])
+        logger.info(f"[ICD] # Admissions: {module.stay_id.nunique()}")
+        logger.info(f"[ICD] Total rows: {module.shape[0]}")
     return module
 
 

@@ -145,16 +145,21 @@ def feature_icu_db(
             chart = drop_wrong_uom(chart, 0.95)
 
             # Save chart events data
+            logger.info("[PREPARING CHART EVENTS OUTPUT DATA]")
             chart_output = chart[
                 ["stay_id", "itemid", "event_time_from_admit", "valuenum"]
             ]
-            chart_output.to_csv(
-                "./data/features/preproc_chart_icu.csv.gz",
-                compression="gzip",
-                index=False,
-            )
             logger.info(
-                f"[SUCCESSFULLY SAVED {len(chart_output):,} CHART EVENT RECORDS]"
+                f"[SAVING {len(chart_output):,} CHART EVENT RECORDS TO DATABASE]"
+            )
+            conn.execute("DROP TABLE IF EXISTS preproc_chart_icu")
+            conn.register("temp_chart_output", chart_output)
+            conn.execute("""
+                CREATE TABLE preproc_chart_icu AS
+                SELECT * FROM temp_chart_output
+            """)
+            logger.info(
+                f"[SUCCESSFULLY SAVED {len(chart_output):,} CHART EVENT RECORDS TO DATABASE]"
             )
 
         if proc_flag:

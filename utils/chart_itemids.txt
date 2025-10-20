@@ -1,8 +1,6 @@
 # Routine Vitals
 220045
 #HR
-220048
-#Heart Rhythm
 220050
 #ABPs
 220051
@@ -15,8 +13,6 @@
 #NBPd
 220181
 #NBPm
-223761
-#Temperature F
 223762
 #Temperature C
 223763
@@ -63,26 +59,6 @@
 #Orthostatic BPd standing
 226329
 #Blood Temp CCO (C)
-226479
-#Ectopy Type 2
-226480
-#Ectopy Frequency 2
-227242
-#Manual BPd R
-227243
-#Manual BPs R
-227630
-#"Arctic Sun Temp
-#1 Location"
-227631
-#"Arctic Sun Temp
-#2 Location"
-227632
-#"Arctic Sun/Alsius Temp
-#1 C"
-227634
-#"Arctic Sun/Alsius Temp
-#2 C"
 228229
 #PAR-Activity
 228230
@@ -91,15 +67,9 @@
 #PAR-Consciousness
 228232
 #PAR-Oxygen saturation
-228233
-#PAR-Remain sedated
 228234
 #PAR-Respiration
 228640
 #EtCO2
-228641
-#EtCO2 Clinical indication
 229862
 #Forehead SpO2 Sensor in Place
-229863
-#Forehead Sensor Position Changed

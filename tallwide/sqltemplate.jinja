@@ -1,0 +1,35 @@
+-- Transform event data into hourly rows with latest values for each itemid
+WITH hourly_data AS (
+  SELECT
+    stay_id,
+    CEIL(EXTRACT(EPOCH FROM event_time_from_admit) / 3600)::INT AS hour,
+    itemid,
+    valuenum,
+    -- break ties by ordering event_time_from_admit descending between stay_id, hour, and itemid triples
+    ROW_NUMBER() OVER (
+      PARTITION BY stay_id, CEIL(EXTRACT(EPOCH FROM event_time_from_admit) / 3600), itemid
+      ORDER BY event_time_from_admit DESC
+    ) AS rn
+  FROM {{ table_name }}
+),
+latest_per_hour AS (
+  SELECT
+    stay_id,
+    hour,
+    itemid,
+    valuenum
+  FROM hourly_data
+--  only keep the latest event per triple
+  WHERE rn = 1
+)
+SELECT
+  stay_id,
+  hour,
+  -- pivot itemids into columns; not the best way but works ig
+  {% for itemid in itemid_whitelist %}
+  MAX(CASE WHEN itemid = {{ itemid }} THEN valuenum END) AS itemid_{{ itemid }}
+  {%- if not loop.last %},{% endif %}
+  {% endfor %}
+FROM latest_per_hour
+GROUP BY stay_id, hour
+ORDER BY stay_id, hour;
